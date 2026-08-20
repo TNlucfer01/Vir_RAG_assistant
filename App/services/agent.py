@@ -1,8 +1,6 @@
 """
 services/agent.py — Vir's Agentic Reasoning Loop
 
-This is the core of the new architecture.
-
 Instead of hard-coded routing (LOOKUP / COMPUTE / HYBRID via regex),
 Vir now:
   1. Receives the question and conversation history.
@@ -16,9 +14,48 @@ This gives the model full agency over retrieval strategy, with no manual routing
 """
 
 import json
-from groq import Groq
+import logging
+from groq import Groq, RateLimitError, APIConnectionError, APITimeoutError, APIStatusError
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception,
+    before_sleep_log,
+)
 from config import GROQ_API_KEY, GROQ_MODEL
 from services.agent_tools import AGENT_TOOL_DEFINITIONS, execute_agent_tool
+
+logger = logging.getLogger(__name__)
+
+
+def _groq_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, (RateLimitError, APIConnectionError, APITimeoutError)):
+        return True
+    if isinstance(exc, APIStatusError):
+        return exc.status_code in (500, 502, 503, 504)
+    return False
+
+
+@retry(
+    retry=retry_if_exception(_groq_retryable),
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1, min=2, max=20),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+def _call_groq(client: Groq, messages: list, tools: list, stream: bool = False, **kwargs):
+    """Single retried Groq API call — shared by agent rounds and final synthesis."""
+    return client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=messages,
+        tools=tools if tools else None,
+        tool_choice="auto" if tools else None,
+        temperature=0.2,
+        max_tokens=2048,
+        stream=stream,
+        **kwargs,
+    )
 
 _client = Groq(api_key=GROQ_API_KEY)
 
@@ -47,12 +84,17 @@ You have access to the following tools:
 - **Call multiple tools when needed.** For example:
   - "Who has the highest marks and where is the exam office?" → sql_query + find_path
   - "Explain the GPA formula and tell me Aathi's current GPA" → vector_search + sql_query
-- **If a tool returns no results,** try an alternate query (e.g., rephrase, use different keywords) before giving up.
+- **If a tool returns no results,** try an alternate query before giving up.
 - **Never fabricate data.** Only answer based on tool results. If tools return nothing relevant, say so honestly.
 - **For aggregation questions** (average marks, top students, count by dept) → always use sql_query.
 - **For concept/policy questions** (what is arrear, how is CGPA calculated) → always use vector_search.
 - **For navigation** (how to get to room X, where is the library) → use find_path or list_rooms.
-- **Keep responses concise and direct.** No meta-commentary like "I searched the database and found...".
+
+## CITATIONS (IMPORTANT)
+- When vector_search returns results, the tool output includes a SOURCES block listing the PDF filename and page numbers.
+- Always end your answer with a **Sources:** line citing the relevant documents.
+- Format: `**Sources:** Undergraduate Programme - Academic Regulations 2021.pdf (p. 15, 28)`
+- For SQL data, no citation is needed (it comes from the live database).
 
 ## COLLEGE CONTEXT
 - College: P.T. Lee Chengalvaraya Naicker College of Engineering and Technology
@@ -89,7 +131,7 @@ def run_agent(question: str, history: list = None) -> dict:
         if isinstance(msg, dict) and msg.get("role") in ("user", "assistant") and msg.get("content"):
             messages.append({"role": msg["role"], "content": msg["content"]})
 
-    # Append the current question
+    # Append the current question why do we ned these roles at all 
     messages.append({"role": "user", "content": question})
 
     tools_used = []
@@ -104,14 +146,7 @@ def run_agent(question: str, history: list = None) -> dict:
         print(f"\n[Agent] Round {round_num}/{MAX_ROUNDS} — {len(messages)} messages in context")
 
         try:
-            response = _client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=messages,
-                tools=AGENT_TOOL_DEFINITIONS,
-                tool_choice="auto",
-                temperature=0.2,
-                max_tokens=2048,
-            )
+            response = _call_groq(_client, messages, AGENT_TOOL_DEFINITIONS)
         except Exception as e:
             print(f"[Agent] LLM call failed on round {round_num}: {e}")
             return {
@@ -181,12 +216,7 @@ def run_agent(question: str, history: list = None) -> dict:
     })
 
     try:
-        final_response = _client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            temperature=0.2,
-            max_tokens=1024,
-        )
+        final_response = _call_groq(_client, messages, [], max_tokens=1024)
         final_answer = final_response.choices[0].message.content or \
             "I was unable to produce a complete answer. Please try rephrasing your question."
     except Exception as e:

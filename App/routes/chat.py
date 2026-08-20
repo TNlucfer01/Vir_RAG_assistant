@@ -20,6 +20,7 @@ from services.sql_engine import run_sql
 from services.followups import generate_followup_questions
 from services.llm import generate_response
 from services.map_tools import TOOL_DEFINITIONS as MAP_TOOL_DEFINITIONS, execute_tool as execute_map_tool
+from services.session_store import load_history, save_exchange
 
 import json
 from groq import Groq
@@ -97,6 +98,7 @@ class ChatRequest(BaseModel):
     question: str
     filename: str = ""       # kept for API compatibility; agent searches all docs
     history: list = []
+    session_id: str = ""     # optional persistent session ID for multi-turn memory
 
 
 # ── Chat Endpoint ──────────────────────────────────────────────────────────────
@@ -104,7 +106,14 @@ class ChatRequest(BaseModel):
 @router.post("/chat")
 async def chat(request: ChatRequest):
     question = request.question.strip()
-    history = request.history
+    session_id = request.session_id.strip()
+
+    # ── Load history: session store takes priority over inline history ─────────
+    if session_id:
+        history = load_history(session_id)
+        print(f"[Chat] Session {session_id[:8]}… — loaded {len(history)} turns from store")
+    else:
+        history = request.history
 
     # ──────────────────────────────────────────────────────────────────────────
     # Fast-Path: handle obvious queries without the full agent loop
@@ -116,11 +125,14 @@ async def chat(request: ChatRequest):
         print(f"\n[Chat] Fast-path: sql_only")
         answer = _handle_sql_only(question)
         followups = generate_followup_questions(question=question, answer=answer)
+        if session_id:
+            save_exchange(session_id, question, answer)
         return {
             "question": question,
             "answer": answer,
             "followups": followups,
             "source": "fast_path_sql",
+            "session_id": session_id,
             "debug": {"path": "sql_only"},
         }
 
@@ -128,11 +140,14 @@ async def chat(request: ChatRequest):
         print(f"\n[Chat] Fast-path: map_only")
         answer = _handle_map_only(question, history)
         followups = generate_followup_questions(question=question, answer=answer)
+        if session_id:
+            save_exchange(session_id, question, answer)
         return {
             "question": question,
             "answer": answer,
             "followups": followups,
             "source": "fast_path_map",
+            "session_id": session_id,
             "debug": {"path": "map_only"},
         }
 
@@ -148,6 +163,9 @@ async def chat(request: ChatRequest):
     tools_used = result["tools_used"]
     rounds = result["rounds"]
 
+    if session_id:
+        save_exchange(session_id, question, answer)
+
     followups = generate_followup_questions(question=question, answer=answer)
 
     print(f"[Chat] Tools used: {tools_used} | Rounds: {rounds}")
@@ -157,6 +175,7 @@ async def chat(request: ChatRequest):
         "answer": answer,
         "followups": followups,
         "source": "agent",
+        "session_id": session_id,
         "debug": {
             "tools_used": tools_used,
             "rounds": rounds,

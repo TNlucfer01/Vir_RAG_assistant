@@ -11,9 +11,22 @@ each tool call it makes.
 """
 
 import json
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception, before_sleep_log
 from services.retriever import retrieve_context
+from services.vectordb import search_embeddings, client as qdrant_client, COLLECTION_NAME
+from services.embeddings import generate_query_embedding
 from services.sql_engine import run_sql
 from services.map_tools import execute_tool as execute_map_tool, TOOL_DEFINITIONS as MAP_TOOL_DEFINITIONS
+
+logger = logging.getLogger(__name__)
+
+
+def _network_retryable(exc: BaseException) -> bool:
+    import requests
+    return isinstance(exc, (requests.ConnectionError, requests.Timeout, TimeoutError, ConnectionError))
+
+
 
 
 # ── Tool Definitions (sent to Groq) ────────────────────────────────────────────
@@ -112,16 +125,55 @@ def execute_agent_tool(tool_name: str, arguments_json: str) -> str:
         if not query:
             return "[Tool Error] vector_search requires a 'query' argument."
         try:
-            context = retrieve_context(
-                question=query,
-                filename=None,          # always search all documents
-                question_type="General",
-                max_chars=8000,
+            # Get query embedding
+            query_embedding = generate_query_embedding(query)
+
+            # Search Qdrant directly so we can access filename + page metadata
+            from services.vectordb import search_embeddings
+            results = search_embeddings(
+                query_embedding=query_embedding,
+                filename=None,
+                top_k=top_k,
             )
-            if not context.strip():
+
+            documents = results.get("documents", [[]])[0]
+            pages = results.get("pages", [])
+            filenames = results.get("filenames", [])
+
+            if not documents:
                 return "No relevant documents found for this query."
-            print(f"[AgentTools] vector_search returned {len(context)} chars")
-            return context
+
+            # De-duplicate chunks
+            from services.context_filter import remove_duplicate_chunks
+            unique_docs = remove_duplicate_chunks(documents)
+
+            # Build context with inline source markers
+            context_parts = []
+            sources_seen = {}   # filename → set of pages
+            for doc, page, fname in zip(documents, pages, filenames):
+                if doc not in unique_docs:
+                    continue
+                tag = f"[{fname}, p.{page}]" if page else f"[{fname}]"
+                context_parts.append(f"{tag}\n{doc}")
+                if fname not in sources_seen:
+                    sources_seen[fname] = set()
+                if page:
+                    sources_seen[fname].add(page)
+
+            # Assemble context (cap at 8000 chars)
+            context = "\n\n".join(context_parts)[:8000]
+
+            # Append a clean SOURCES block for the model to cite
+            sources_block = "\n\nSOURCES:\n" + "\n".join(
+                f"- {fname} (pages: {', '.join(str(p) for p in sorted(pages_set))})"
+                if pages_set else f"- {fname}"
+                for fname, pages_set in sources_seen.items()
+            )
+
+            full_result = context + sources_block
+            print(f"[AgentTools] vector_search returned {len(full_result)} chars, sources: {list(sources_seen.keys())}")
+            return full_result
+
         except Exception as e:
             return f"[Tool Error] vector_search failed: {e}"
 
