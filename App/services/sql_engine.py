@@ -236,9 +236,30 @@ def _generate_sql(schema_text: str, question: str, previous_error: str = None, p
         raise RuntimeError(f"LLM SQL generation failed: {e}")
 
 
+
+# Regex that catches any destructive keyword anywhere in the SQL (blocks bypass tricks
+# like "WITH t AS (DELETE ...) SELECT ...").
+_DESTRUCTIVE_SQL_RE = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE|REPLACE"
+    r"|ATTACH|DETACH|VACUUM|REINDEX|ANALYZE"
+    r"|PRAGMA\s+(?!table_info|index_list|index_info|foreign_key_list|table_xinfo))\b",
+    re.IGNORECASE,
+)
+
+
 def _safe_execute(conn: sqlite3.Connection, sql: str) -> dict:
-    """Safely execute a SELECT or WITH query against SQLite."""
-    first_token = sql.strip().split()[0].upper() if sql.strip() else ""
+    """
+    Safely execute a SELECT or WITH … SELECT query against SQLite.
+
+    Guards (layered):
+      1. First token must be SELECT or WITH.
+      2. Full SQL is scanned for any destructive keyword (blocks CTE bypass tricks).
+      3. Connection is put into query_only mode before execution.
+    """
+    stripped = sql.strip()
+
+    # Guard 1 — first token
+    first_token = stripped.split()[0].upper() if stripped else ""
     if first_token not in ("SELECT", "WITH"):
         return {
             "sql": sql,
@@ -247,13 +268,25 @@ def _safe_execute(conn: sqlite3.Connection, sql: str) -> dict:
             "error": "Only SELECT queries are permitted.",
         }
 
+    # Guard 2 — destructive keyword anywhere in the statement
+    if _DESTRUCTIVE_SQL_RE.search(stripped):
+        return {
+            "sql": sql,
+            "columns": [],
+            "rows": [],
+            "error": "Query contains a disallowed keyword and was blocked.",
+        }
+
     try:
-        cursor = conn.execute(sql)
+        # Guard 3 — set read-only mode at the connection level
+        conn.execute("PRAGMA query_only = ON")
+        cursor = conn.execute(stripped)
         columns = [desc[0] for desc in cursor.description] if cursor.description else []
         rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
-        return {"sql": sql, "columns": columns, "rows": rows, "error": None}
+        return {"sql": stripped, "columns": columns, "rows": rows, "error": None}
     except sqlite3.Error as e:
-        return {"sql": sql, "columns": [], "rows": [], "error": str(e)}
+        return {"sql": stripped, "columns": [], "rows": [], "error": str(e)}
+
 
 
 # ---------------------------------------------------------------------------

@@ -5,11 +5,11 @@ def get_top_k(question_type: str) -> int:
     """
 
     strategies = {
-        "summary": 20,
-        "comparison": 12,
-        "list": 10,
-        "explanation": 8,
-        "general": 6,
+        "summary": 3,
+        "comparison": 3,
+        "list": 3,
+        "explanation": 3,
+        "general": 3,
         "definition": 3,
     }
 

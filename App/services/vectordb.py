@@ -15,6 +15,9 @@ from services.section_parser import detect_section
 
 COLLECTION_NAME = "ptlee_docs" #testing
 
+QDRANT_TIMEOUT = 120  # seconds — large PDFs need more time to upsert
+
+
 def _get_qdrant_client():
     if QDRANT_URL and QDRANT_API_KEY:
         try:
@@ -22,14 +25,14 @@ def _get_qdrant_client():
                 url=QDRANT_URL,
                 api_key=QDRANT_API_KEY,
                 check_compatibility=False,
-                timeout=5,          # ← Don't hang startup if cloud is unreachable
+                timeout=QDRANT_TIMEOUT,
             )
-            c.get_collections() # we need to see this a time
+            c.get_collections()
             return c
         except Exception as e:
             print(f"Warning: Cloud Qdrant connection failed ({e}). Falling back to local storage './data/qdrant_db'")
     os.makedirs("data/qdrant_db", exist_ok=True)
-    return QdrantClient(path="data/qdrant_db") #what does the qdrant client evean means  ? 
+    return QdrantClient(path="data/qdrant_db")
 
 client = _get_qdrant_client()
 
@@ -99,13 +102,18 @@ def store_embeddings(chunks, embeddings, filename):
 
     print("\n=============================\n")
 
-    client.upsert(
-        collection_name=COLLECTION_NAME,
-        points=points,
-        wait=True,
-    )
+    BATCH_SIZE = 50
+    for i in range(0, len(points), BATCH_SIZE):
+        batch = points[i:i + BATCH_SIZE]
+        client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=batch,
+            wait=True,
+        )
+        print(f"  Upserted batch {i//BATCH_SIZE + 1}/{(len(points)-1)//BATCH_SIZE + 1} ({len(batch)} points)")
 
     return len(points)
+
 
 
 # --------------------------------------------------

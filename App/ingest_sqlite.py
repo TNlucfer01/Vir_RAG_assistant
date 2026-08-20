@@ -760,8 +760,20 @@ def ingest_attendance(conn: sqlite3.Connection):
                 """, ("INSTITUTIONAL_BATCH", "Class Aggregate", "IT", 4, code, cname, fac, total_c, att_c, miss_c, round(pct, 2), status, "Academic Semester"))
                 loaded += 1
 
+    # Back-fill attendance_percentage for any rows where it was not set during import
+    # (happens when the CSV has raw counts but no computed percentage column)
+    conn.execute("""
+        UPDATE attendance
+        SET attendance_percentage = ROUND(
+            CAST(classes_attended AS REAL) / NULLIF(total_classes_conducted, 0) * 100.0, 2
+        )
+        WHERE attendance_percentage IS NULL
+          AND total_classes_conducted IS NOT NULL
+          AND total_classes_conducted > 0
+    """)
     conn.commit()
-    print(f"✓ Attendance table populated: {loaded} records.")
+    backfilled = conn.execute("SELECT COUNT(*) FROM attendance WHERE attendance_percentage IS NOT NULL").fetchone()[0]
+    print(f"✓ Attendance table populated: {loaded} records (attendance_percentage computed for {backfilled} rows).")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
